@@ -637,22 +637,6 @@ PROVIDER_FALLBACK_ORDER=
 
 Configure `PROVIDER_FALLBACK_ORDER=microsoft`, `elevenlabs` ou `microsoft,elevenlabs` e preencha as chaves correspondentes.
 
-## O Que Ainda Não Está Implementado
-
-A biblioteca cobre o núcleo de fallback em aplicação, mas ainda não implementa itens operacionais de produto completo:
-
-```text
-API HTTP/gateway para produção
-dashboards de SLA
-alertas automáticos
-health check sintético contínuo
-multi-região OCI
-política por tenant/cliente
-reserva de capacidade
-relatório mensal de disponibilidade
-integração direta com LiveKit
-```
-
 ## Observações
 
 O caminho xAI OCI é streaming via WebSocket. Microsoft e ElevenLabs são consumidos por HTTP streaming nesta lib: a resposta é lida em chunks e cada chunk vira um evento `audio`. Isso melhora tempo até o primeiro áudio no fallback externo, mas ainda não preserva continuidade se o xAI OCI já tiver começado a falar.
