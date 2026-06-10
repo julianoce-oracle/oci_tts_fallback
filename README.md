@@ -1,65 +1,63 @@
 # TTS Fallback
 
-Biblioteca standalone para implementar uma camada de resiliência de TTS em nível de aplicação usando xAI OCI via WebSocket como provedor primário.
+Uma biblioteca Python para deixar TTS mais resiliente em aplicações de voz em tempo real.
 
-Ela foi pensada para aplicações de voz em tempo real que precisam continuar respondendo quando o WebSocket primário fica lento, fecha antes do áudio, não entrega o primeiro chunk ou o provedor principal fica indisponível.
+A lib usa **xAI OCI via WebSocket** como provedor principal. Se o WebSocket falhar antes de produzir áudio, ela pode:
 
-Endpoint primário:
+- tentar outro WebSocket quente;
+- tocar uma frase curta de espera a partir do cache local;
+- tentar recuperar o WebSocket principal;
+- cair para Microsoft Azure Speech ou ElevenLabs em modo streaming.
+
+A ideia não é trocar de voz no meio da fala. A ideia é evitar silêncio e recuperar com segurança.
+
+## Modelo Mental
+
+Pense no fluxo assim:
 
 ```text
-wss://inference.generativeai.us-chicago-1.oci.oraclecloud.com/xai/v1/tts
+1. tente falar pelo xAI OCI
+2. se ainda não saiu áudio, é seguro tentar outra rota
+3. se demorar ou cair, toque uma frase de espera cacheada
+4. tente recuperar o WebSocket principal
+5. se não recuperar, use outro provider streaming
+6. se a fala original já começou, não reinicie a frase automaticamente
 ```
 
+A regra principal é simples:
+
+```text
+Depois que uma origem começou a emitir áudio, ela é a dona daquela fala.
+```
+
+Isso evita áudio duplicado quando uma tentativa atrasada responde depois.
 
 ## Instalação
-
-Instale as dependências:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Para importar a lib em scripts locais, execute a partir da raiz do projeto ou adicione o diretório ao `PYTHONPATH`:
+Para usar localmente sem empacotar a lib:
 
 ```bash
-cd /home/ubuntu/tts-fallback
+cd /home/ubuntu/tts-fallback2
 python3 seu_script.py
 ```
 
 ou:
 
 ```bash
-PYTHONPATH=/home/ubuntu/tts-fallback python3 seu_script.py
+PYTHONPATH=/home/ubuntu/tts-fallback2 python3 seu_script.py
 ```
 
-Configure a chave primária da xAI OCI no ambiente ou em um arquivo `.env` carregado pela sua aplicação:
+Configure a chave do provedor principal:
 
 ```text
 OCI_GENAI_API_KEY=...
 ```
 
-Se quiser provider fallback externo, configure também Microsoft ou ElevenLabs:
-
-```text
-PROVIDER_FALLBACK_ORDER=microsoft
-MICROSOFT_SPEECH_KEY=...
-MICROSOFT_SPEECH_REGION=eastus
-MICROSOFT_SPEECH_VOICE=pt-BR-FranciscaNeural
-```
-
-ou:
-
-```text
-PROVIDER_FALLBACK_ORDER=elevenlabs
-ELEVENLABS_API_KEY=...
-ELEVENLABS_VOICE_ID=...
-```
-
-## Uso Como Biblioteca
-
-O ponto principal da lib é `FallbackTTS`. Ele abre um pool de WebSockets xAI OCI, emite eventos de síntese e entrega chunks de áudio conforme chegam.
-
-Exemplo mínimo:
+## Quick Start
 
 ```python
 import asyncio
@@ -74,8 +72,6 @@ async def main() -> None:
         voice="c8x2ieiocufs",
         language="pt-BR",
         codec="mp3",
-        sample_rate=24000,
-        bit_rate=128000,
     )
 
     audio = bytearray()
@@ -83,19 +79,11 @@ async def main() -> None:
     async with FallbackTTS(
         endpoint=endpoint,
         pool=PoolConfig(size=3),
-        timeouts=Timeouts(
-            connect_s=5.0,
-            first_audio_s=1.5,
-            chunk_s=10.0,
-            acquire_s=3.0,
-        ),
+        timeouts=Timeouts(first_audio_s=1.5, chunk_s=10.0),
     ) as tts:
         await tts.wait_until_ready(min_ready=1, timeout_s=8.0)
 
-        async for event in tts.stream(
-            "Por favor, aguarde um momento.",
-            mode=FallbackMode.SEQUENTIAL,
-        ):
+        async for event in tts.stream("Por favor, aguarde um momento.", mode=FallbackMode.SEQUENTIAL):
             if event.type == "audio" and event.audio:
                 audio.extend(event.audio)
             else:
@@ -107,333 +95,188 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-Eventos importantes:
+## Eventos
 
-```text
-attempt_started  uma tentativa começou em um socket/provider
-winner           uma origem começou a entregar áudio válido
-audio            chunk de áudio recebido
-completed        síntese concluída
-attempt_failed   uma tentativa falhou
-cache_hit        áudio local usado como fallback de recuperação
-cache_saved      áudio salvo para possível recuperação futura
-```
+A lib emite eventos para você conectar com seu player, logs ou métricas.
 
-## Política Recomendada
+| Evento | Quando aparece | O que fazer |
+| --- | --- | --- |
+| `attempt_started` | Uma tentativa começou | Log/métrica |
+| `winner` | A primeira origem entregou áudio válido | Marcar rota vencedora |
+| `audio` | Chegou um chunk de áudio | Enviar ao player/cliente |
+| `completed` | A fala terminou | Fechar a resposta |
+| `attempt_failed` | Uma tentativa falhou | Log/métrica |
+| `cache_hit` | A frase de espera saiu do cache | Tocar espera e continuar recuperação |
+| `recovery_retry` | A lib tentou recuperar xAI depois da espera | Log/métrica |
+| `cache_saved` | Um áudio foi salvo para uso futuro | Log/métrica |
 
-A política recomendada para produto é:
+## Padrões De Uso
 
-```text
-1. xAI OCI via WebSocket é a primeira opção.
-2. O pool tenta manter conexões saudáveis.
-3. Se um socket falha antes do primeiro áudio, outro socket pode assumir.
-4. Se nenhum áudio saiu do xAI OCI, toca uma frase curta de espera vinda do cache local.
-5. Depois da frase de espera, tenta recuperar o xAI OCI e sintetizar o texto original novamente.
-6. Se ainda não houver WebSocket funcional, pode cair para Microsoft ou ElevenLabs.
-7. Se algum áudio do texto original já saiu, não reinicia a frase inteira automaticamente.
-```
+### 1. Sequential: modo padrão e conservador
 
-O ponto mais importante é a fronteira entre antes e depois do primeiro áudio:
-
-```text
-antes do primeiro áudio: é seguro tentar outra rota
-depois do primeiro áudio: reiniciar pode duplicar fala para o usuário
-```
-
-Por isso, falhas no meio do stream geram `PartialSynthesisError` por padrão.
-
-## Implementando Fallback Sequencial
-
-Use `FallbackMode.SEQUENTIAL` quando quiser o comportamento mais conservador: tentar um socket e, se ele falhar antes do primeiro chunk de áudio, tentar outro socket saudável do pool.
+Use quando você quer tentar um WebSocket saudável por vez.
 
 ```python
-from tts_fallback import FallbackMode
-
-async for event in tts.stream(
-    text,
-    mode=FallbackMode.SEQUENTIAL,
-):
+async for event in tts.stream(text, mode=FallbackMode.SEQUENTIAL):
     if event.type == "audio":
         player.write(event.audio)
 ```
 
-Esse modo cobre:
+Se o primeiro socket falhar **antes** do primeiro áudio, outro socket pode assumir. Se a fala já começou, a lib evita reiniciar a frase por padrão.
 
-```text
-falha ao conectar
-first audio timeout
-evento de erro do provider
-close inesperado antes de áudio
-mensagem inválida do protocolo
-```
+Bom para:
 
-Se a falha acontece depois que o áudio já começou, a lib não reinicia o texto por padrão.
+- fluxo normal de produção;
+- menor custo;
+- evitar duplicação de fala.
 
-## Implementando Hedged Request
+### 2. Hedged: menor latência, maior custo
 
-Use `FallbackMode.HEDGED` quando latência p95/p99 for mais importante que custo. A lib envia a mesma frase para mais de um WebSocket e usa o primeiro que devolver áudio.
+Use quando p95/p99 de latência importa muito.
 
 ```python
-async for event in tts.stream(
-    text,
-    mode=FallbackMode.HEDGED,
-    hedges=2,
-):
-    if event.type == "winner":
-        print("socket vencedor", event.connection_id)
-    elif event.type == "audio":
+async for event in tts.stream(text, mode=FallbackMode.HEDGED, hedges=2):
+    if event.type == "audio":
         player.write(event.audio)
 ```
 
-Depois que existe um vencedor:
+No hedged, a mesma frase vai para mais de um WebSocket. O primeiro que emitir áudio vence; os outros são cancelados ou ignorados.
 
-```text
-chunks do vencedor são emitidos
-sockets perdedores são fechados
-perdedores são repostos pelo reconnect
-áudio atrasado dos perdedores é ignorado
-```
+Isso é o que antes estava descrito como `winner-takes-stream`: não é uma feature separada para você configurar, é a regra de segurança que faz o hedged não duplicar áudio.
 
-## Implementando Cache Como Fallback De Recuperação
+Bom para:
 
-O cache local não deve ser usado como primeira opção e também não deve substituir o texto original. Ele serve para tocar uma frase curta de espera enquanto a aplicação tenta recuperar um WebSocket funcional.
+- reduzir cauda de latência;
+- lidar com sockets lentos;
+- planos premium ou chamadas críticas.
 
-Use o cache assim:
+### 3. Frase de espera em cache
 
-```text
-1. tente xAI OCI normalmente para o texto original
-2. se xAI OCI não produzir nenhum áudio, toque uma frase cacheada de espera
-3. depois da frase de espera, tente xAI OCI novamente para o texto original
-4. se recuperar, entregue o áudio original depois da espera
-5. se não recuperar, caia para provider externo ou encerre com erro controlado
-```
+O cache não substitui o texto original. Ele toca uma frase curta enquanto a aplicação tenta recuperar o WebSocket.
 
-Exemplo de frase de espera:
+Exemplo:
 
 ```text
 Por favor, aguarde um momento.
 ```
 
-Exemplo de integração:
-
-```python
-from pathlib import Path
-
-from tts_fallback import (
-    AudioCache,
-    CacheConfig,
-    EndpointConfig,
-    FallbackMode,
-    FallbackTTS,
-    codec_extension,
-)
-
-
-def xai_cache_profile(endpoint: EndpointConfig) -> dict[str, object]:
-    return {
-        "provider": "xai-oci",
-        "voice": endpoint.voice,
-        "language": endpoint.language,
-        "codec": endpoint.codec,
-        "sampleRate": endpoint.sample_rate,
-        "bitRate": endpoint.bit_rate if endpoint.codec == "mp3" else None,
-    }
-
-
-async def try_xai(text: str, tts: FallbackTTS) -> bytes:
-    audio = bytearray()
-    async for event in tts.stream(text, mode=FallbackMode.SEQUENTIAL):
-        if event.type == "audio" and event.audio:
-            audio.extend(event.audio)
-    return bytes(audio)
-
-
-async def synthesize_with_wait_recovery(text: str, tts: FallbackTTS, endpoint: EndpointConfig) -> bytes:
-    cache = AudioCache(CacheConfig(cache_dir=Path("cache/audio"), mode="static"))
-    output = bytearray()
-
-    try:
-        audio = await try_xai(text, tts)
-        if audio:
-            return audio
-    except Exception:
-        # Se já houve áudio parcial do texto original, deixe a exceção subir no seu app.
-        pass
-
-    wait = cache.get(
-        "Por favor, aguarde um momento.",
-        profile=xai_cache_profile(endpoint),
-        extension=codec_extension(endpoint.codec),
-    )
-    if wait:
-        output.extend(wait.audio)
-        # No app real, envie este áudio ao player imediatamente.
-
-    recovered_audio = await try_xai(text, tts)
-    if recovered_audio:
-        output.extend(recovered_audio)
-        return bytes(output)
-
-    # Aqui você pode chamar Microsoft/ElevenLabs streaming ou retornar erro controlado.
-    return bytes(output)
-```
-
-
-Modos de cache:
+Fluxo recomendado:
 
 ```text
-off     nunca lê nem grava cache
-static  cacheia somente frases estáticas conhecidas
-all     cacheia qualquer texto de entrada
+xAI falhou antes de áudio
+-> tocar frase de espera cacheada
+-> tentar xAI de novo
+-> se recuperar, falar o texto original
+-> se não recuperar, cair para provider externo
 ```
 
-O padrão recomendado é `static`, porque evita gravar texto dinâmico com dados sensíveis.
-
-Frases estáticas padrão:
+Variáveis úteis:
 
 ```text
-Bem-vindo de volta.
-Por favor, aguarde um momento.
-Um momento, por favor.
-Estou verificando isso agora.
-Obrigado pela paciência.
-Pode repetir, por favor?
-Não consegui processar sua solicitação agora.
-Sua solicitação foi concluída.
-Estamos transferindo seu atendimento.
-Ainda estou aqui.
+TTS_RECOVERY_CACHE_TEXT=Por favor, aguarde um momento.
+TTS_RECOVERY_RETRIES=1
+TTS_CACHE_MODE=static
+TTS_CACHE_DIR=/home/ubuntu/tts-fallback2/cache/audio
 ```
 
-## Implementando Provider Fallback
+### 4. Provider fallback streaming
 
-Microsoft e ElevenLabs são fallbacks externos opcionais e também são consumidos em modo streaming pela lib. Eles só devem entrar se xAI OCI não produzir nenhum áudio e se não houver cache local de recuperação aplicável.
-
-```python
-from tts_fallback import build_provider_chain_from_env, stream_provider_fallback
-
-
-async def synthesize_with_provider_fallback(text: str) -> bytes:
-    providers = build_provider_chain_from_env("microsoft,elevenlabs")
-    audio = bytearray()
-
-    async for event in stream_provider_fallback(text, providers):
-        if event.type == "audio" and event.audio:
-            # Envie este chunk imediatamente ao player/cliente.
-            audio.extend(event.audio)
-        else:
-            print(event.to_log_dict())
-
-    return bytes(audio)
-```
-
-Provider fallback agora emite chunks de áudio conforme a resposta HTTP vai chegando. Mesmo assim, ele só é acionado antes de qualquer áudio do xAI OCI sair; se o primário já começou a falar, trocar para outro provider ainda poderia duplicar a frase.
-
-Ajuste o tamanho dos chunks por variável de ambiente:
+Microsoft e ElevenLabs entram quando:
 
 ```text
+xAI não produziu nenhum áudio
+a frase de espera já foi tocada ou não estava disponível
+a recuperação do xAI não funcionou
+```
+
+Ambos são consumidos como streaming pela lib: cada bloco recebido vira um evento `audio`.
+
+Configuração Microsoft:
+
+```text
+PROVIDER_FALLBACK_ORDER=microsoft
+MICROSOFT_SPEECH_KEY=...
+MICROSOFT_SPEECH_REGION=eastus
+MICROSOFT_SPEECH_VOICE=pt-BR-FranciscaNeural
+MICROSOFT_SPEECH_OUTPUT_FORMAT=audio-24khz-48kbitrate-mono-mp3
 MICROSOFT_SPEECH_CHUNK_SIZE=8192
+```
+
+Configuração ElevenLabs:
+
+```text
+PROVIDER_FALLBACK_ORDER=elevenlabs
+ELEVENLABS_API_KEY=...
+ELEVENLABS_VOICE_ID=...
+ELEVENLABS_MODEL_ID=eleven_multilingual_v2
+ELEVENLABS_OUTPUT_FORMAT=mp3_44100_128
 ELEVENLABS_CHUNK_SIZE=8192
 ```
 
-Para ElevenLabs, a lib chama o endpoint `/stream` do Text to Speech. Para Microsoft, a lib lê a resposta do endpoint REST em blocos incrementais usando um formato de saída streaming, por exemplo `audio-24khz-48kbitrate-mono-mp3`.
-
-## Ordem Completa Recomendada
-
-Em uma aplicação real, a ordem completa pode ficar assim:
+Ordem com os dois:
 
 ```text
-1. xAI OCI sequential ou hedged para o texto original
-2. se falhar antes do primeiro áudio, tocar frase de espera do cache local
-3. depois da espera, tentar xAI OCI novamente para o texto original
-4. se ainda não recuperar, Microsoft Azure Speech streaming
-5. se Microsoft falhar, ElevenLabs streaming
-6. se tudo falhar, retornar erro controlado para o app
+PROVIDER_FALLBACK_ORDER=microsoft,elevenlabs
 ```
 
-Para frases críticas de atendimento, pré-gere o cache antes de produção. Para texto dinâmico, prefira não cachear ou use uma política explícita de privacidade.
+## O Que A Lib Protege
 
-## Fallbacks Implementados
+| Situação | Proteção |
+| --- | --- |
+| WebSocket lento para começar | `first_audio_timeout` + tentativa em outro socket |
+| Socket fecha antes do áudio | fallback sequencial |
+| Socket responde devagar | hedged request |
+| Endpoint fica temporariamente indisponível | frase de espera cacheada + retry |
+| xAI não recupera | Microsoft/ElevenLabs streaming |
+| Tentativa atrasada responde depois | apenas a origem vencedora continua |
+| Stream trava no meio da fala | `PartialSynthesisError` para evitar duplicação |
 
-| Mecanismo | O que faz | Quando entra | O que protege |
-| --- | --- | --- | --- |
-| Pool de WebSockets quentes | Mantém conexões xAI OCI abertas e prontas | Antes da síntese | Latência de abertura de conexão e falhas isoladas de socket |
-| Fallback sequencial | Tenta outro socket saudável se o primeiro falhar antes do áudio | Antes do primeiro chunk | Erro de conexão, timeout inicial, close prematuro, erro do provider |
-| Hedged request | Envia a mesma frase para mais de um socket e usa o primeiro áudio válido | Em modo `hedged` | Picos de latência e sockets lentos |
-| First-audio timeout | Limita quanto tempo esperar pelo primeiro áudio | Antes do áudio começar | Socket conectado mas travado/mudo |
-| Chunk timeout | Limita quanto tempo esperar entre chunks depois que a fala começou | Durante o stream | Stream parado no meio da fala |
-| Reconnect com backoff | Fecha sockets ruins e reconecta em background com espera progressiva | Depois de falhas | Loop agressivo de reconexão e instabilidade temporária |
-| Cooldown tipo circuit breaker | Aumenta a espera depois de falhas repetidas no mesmo slot | Depois de falhas repetidas | Saturação, auth ruim, rate limit ou endpoint instável |
-| Winner-takes-stream | Só uma origem pode emitir áudio para cada fala | Sequential, hedged e provider fallback | Áudio duplicado ou respostas atrasadas conflitantes |
-| Cache local de recuperação | Toca uma frase curta de espera já gerada | Depois que xAI OCI falha sem produzir áudio | Silêncio enquanto a aplicação tenta recuperar um WebSocket funcional |
-| Provider fallback streaming | Usa Microsoft Azure Speech ou ElevenLabs e emite chunks conforme chegam | Depois que xAI OCI falha sem áudio e cache não resolve | Outage ou falha total do provedor primário com menor tempo até o primeiro áudio |
-
-## Configuração
+## Configuração Completa
 
 ### xAI OCI
 
 ```text
-OCI_GENAI_API_KEY
+OCI_GENAI_API_KEY=...
+```
+
+### Timeouts principais
+
+Configurados via `Timeouts` no código:
+
+```python
+Timeouts(
+    connect_s=5.0,
+    first_audio_s=1.5,
+    chunk_s=10.0,
+    acquire_s=3.0,
+)
 ```
 
 ### Cache
 
 ```text
 TTS_CACHE_MODE=static
-TTS_CACHE_DIR=/home/ubuntu/tts-fallback/cache/audio
+TTS_CACHE_DIR=/home/ubuntu/tts-fallback2/cache/audio
 TTS_CACHE_STATIC_LINES_FILE=
 TTS_RECOVERY_CACHE_TEXT=Por favor, aguarde um momento.
 TTS_RECOVERY_RETRIES=1
 ```
 
-### Provider Fallback Opcional
+Modos de cache:
 
 ```text
-PROVIDER_FALLBACK_ORDER=
+off     não usa cache
+static  só usa frases estáticas conhecidas
+all     permite cachear qualquer texto
 ```
 
-Deixe vazio para não usar Microsoft/ElevenLabs. Preencha apenas quando quiser fallback externo, por exemplo `microsoft`, `elevenlabs` ou `microsoft,elevenlabs`.
-
-### Microsoft Azure Speech Opcional
-
-Use somente se `PROVIDER_FALLBACK_ORDER` incluir `microsoft`.
-
-```text
-MICROSOFT_SPEECH_KEY
-MICROSOFT_SPEECH_REGION=eastus
-MICROSOFT_SPEECH_ENDPOINT=
-MICROSOFT_SPEECH_VOICE=pt-BR-FranciscaNeural
-MICROSOFT_SPEECH_LANGUAGE=pt-BR
-MICROSOFT_SPEECH_OUTPUT_FORMAT=audio-24khz-48kbitrate-mono-mp3
-MICROSOFT_SPEECH_TIMEOUT=30
-MICROSOFT_SPEECH_CHUNK_SIZE=8192
-```
-
-### ElevenLabs Opcional
-
-Use somente se `PROVIDER_FALLBACK_ORDER` incluir `elevenlabs`.
-
-```text
-ELEVENLABS_API_KEY
-ELEVENLABS_VOICE_ID
-ELEVENLABS_MODEL_ID=eleven_multilingual_v2
-ELEVENLABS_LANGUAGE_CODE=pt
-ELEVENLABS_OUTPUT_FORMAT=mp3_44100_128
-ELEVENLABS_BASE_URL=https://api.elevenlabs.io/v1/text-to-speech
-ELEVENLABS_TIMEOUT=30
-ELEVENLABS_CHUNK_SIZE=8192
-```
+Use `static` por padrão para evitar armazenar textos dinâmicos sensíveis.
 
 ## Testes Com CLI
 
-O arquivo `run_fallback_test.py` é um utilitário de validação. Ele mostra os eventos em JSON e ajuda a provar cada fallback sem você precisar escrever código novo.
+`run_fallback_test.py` é só um utilitário para validar comportamento. A lib em si deve ser importada pelo seu app.
 
-O CLI carrega `/home/ubuntu/tts-fallback/.env` por padrão. Para usar outro arquivo:
-
-```bash
-python3 run_fallback_test.py --env-file /caminho/para/.env
-```
-
-### Testar xAI OCI normal
+### Testar fluxo normal
 
 ```bash
 python3 run_fallback_test.py \
@@ -445,17 +288,16 @@ python3 run_fallback_test.py \
   --verbose
 ```
 
-Eventos esperados:
+Esperado:
 
 ```text
 attempt_started
 winner
+audio
 completed
 ```
 
-### Testar fallback sequencial
-
-Força falha no primeiro WebSocket para provar que outro socket assume:
+### Testar falha antes do áudio
 
 ```bash
 python3 run_fallback_test.py \
@@ -463,22 +305,20 @@ python3 run_fallback_test.py \
   --pool-size 3 \
   --cache-mode off \
   --fault close-first-attempt \
-  --text "Teste de fallback sequencial antes do áudio." \
-  --output /tmp/sequential-fallback.mp3 \
+  --text "Teste de fallback sequencial." \
+  --output /tmp/sequential.mp3 \
   --verbose
 ```
 
-Eventos esperados:
+Esperado:
 
 ```text
-attempt_started
 attempt_failed
-attempt_started
 winner
 completed
 ```
 
-### Testar hedged request
+### Testar hedged
 
 ```bash
 python3 run_fallback_test.py \
@@ -486,74 +326,52 @@ python3 run_fallback_test.py \
   --pool-size 3 \
   --hedges 2 \
   --cache-mode off \
-  --text "Teste de hedged request." \
+  --text "Teste hedged." \
   --output /tmp/hedged.mp3 \
   --verbose
 ```
 
-Eventos esperados:
+Esperado: dois `attempt_started`, um `winner`, um `completed`.
 
-```text
-attempt_started
-attempt_started
-winner
-completed
-```
+### Testar frase de espera cacheada
 
-### Testar cache como fallback de recuperação
-
-Este teste força o primário xAI OCI a falhar usando uma variável de ambiente inexistente. O cache deve tocar uma frase de espera e, em seguida, o runner deve registrar uma nova tentativa de recuperação do xAI OCI.
+Este teste força o xAI a falhar usando uma variável inexistente. Se a frase de espera já estiver no cache, ela toca e a lib tenta recuperar depois.
 
 ```bash
 python3 run_fallback_test.py \
   --api-key-env MISSING_OCI_KEY \
   --disable-provider-fallback \
-  --text "Por favor, aguarde um momento." \
-  --output /tmp/cache-fallback.mp3 \
+  --text "Texto original que deveria vir depois da espera." \
+  --output /tmp/recovery-wait.mp3 \
   --verbose
 ```
 
-Eventos esperados:
+Esperado:
 
 ```text
 cache_hit
 recovery_retry
-```
-
-A mensagem deve indicar:
-
-```text
-audio de espera servido do cache local; tentando recuperar websocket em seguida
-```
-
-Se o WebSocket ainda não recuperar e providers externos estiverem desabilitados, o resumo deve mostrar:
-
-```text
 completedOriginal: false
 recovery.audioPlayed: true
 ```
 
-### Testar first-audio timeout
+`completedOriginal: false` significa que só a espera foi gerada nesse teste, porque a chave continua ausente.
+
+### Testar provider fallback
 
 ```bash
 python3 run_fallback_test.py \
-  --mode sequential \
-  --pool-size 3 \
+  --api-key-env MISSING_OCI_KEY \
   --cache-mode off \
-  --first-audio-timeout 0.05 \
-  --disable-provider-fallback \
-  --text "Teste de timeout antes do primeiro áudio." \
-  --output /tmp/first-audio-timeout.mp3 \
+  --provider-fallback-order microsoft,elevenlabs \
+  --text "Teste de provider fallback." \
+  --output /tmp/provider-fallback.mp3 \
   --verbose
 ```
 
-Evento esperado quando o provedor demora mais que o limite:
+Esperado: `winner` no provider que responder primeiro dentro da ordem configurada e múltiplos eventos `audio` se a resposta vier em vários chunks.
 
-```text
-attempt_failed: FirstAudioTimeout
-```
-
-### Testar chunk timeout
+### Testar falha no meio do stream
 
 ```bash
 python3 run_fallback_test.py \
@@ -562,13 +380,13 @@ python3 run_fallback_test.py \
   --cache-mode off \
   --chunk-timeout 0.05 \
   --disable-provider-fallback \
-  --text "Texto longo para gerar vários chunks de áudio e testar timeout no meio do stream." \
+  --text "Texto longo para gerar vários chunks de áudio." \
   --output /tmp/chunk-timeout.mp3 \
   --verbose \
   --debug
 ```
 
-Eventos esperados:
+Esperado:
 
 ```text
 winner
@@ -577,82 +395,24 @@ attempt_failed: ChunkTimeout
 PartialSynthesisError
 ```
 
-Esse comportamento é intencional: se o usuário já recebeu áudio, a biblioteca evita reiniciar a frase inteira automaticamente para não gerar fala duplicada.
-
-### Testar provider fallback
-
-Microsoft:
-
-```bash
-python3 run_fallback_test.py \
-  --api-key-env MISSING_OCI_KEY \
-  --cache-mode off \
-  --provider-fallback-order microsoft \
-  --text "Teste de fallback para Microsoft." \
-  --output /tmp/provider-microsoft.mp3 \
-  --verbose
-```
-
-ElevenLabs:
-
-```bash
-python3 run_fallback_test.py \
-  --api-key-env MISSING_OCI_KEY \
-  --cache-mode off \
-  --provider-fallback-order elevenlabs \
-  --text "Teste de fallback para ElevenLabs." \
-  --output /tmp/provider-elevenlabs.mp3 \
-  --verbose
-```
-
-Cadeia Microsoft e depois ElevenLabs:
-
-```bash
-python3 run_fallback_test.py \
-  --api-key-env MISSING_OCI_KEY \
-  --cache-mode off \
-  --provider-fallback-order microsoft,elevenlabs \
-  --text "Teste de cadeia de providers." \
-  --output /tmp/provider-chain.mp3 \
-  --verbose
-```
+Isso é intencional: se o usuário já ouviu parte da fala, a lib não reinicia automaticamente a frase inteira.
 
 ## Troubleshooting
 
 ### `PartialSynthesisError`
 
-Significa que o WebSocket falhou depois de emitir algum áudio. A lib não reinicia automaticamente a frase inteira para evitar duplicação no player.
+A fala original já tinha começado e o stream falhou. A lib parou para evitar duplicar áudio.
 
-### `cache_miss` depois de falha do xAI OCI
+### `cache_miss` na frase de espera
 
-A frase de espera configurada em `TTS_RECOVERY_CACHE_TEXT` não tinha arquivo local para o mesmo perfil de voz/provedor. Gere essa frase uma vez com xAI OCI funcionando ou rode pré-cache das frases estáticas.
+A frase definida em `TTS_RECOVERY_CACHE_TEXT` não está pré-gerada para o mesmo perfil de voz. Gere essa frase uma vez com xAI funcionando ou rode o pré-cache das frases estáticas.
 
-### Nenhum provider externo é usado
+### Provider externo não entra
 
-Provider fallback externo fica desativado por padrão:
+Por padrão, provider externo fica desativado:
 
 ```text
 PROVIDER_FALLBACK_ORDER=
 ```
 
-Configure `PROVIDER_FALLBACK_ORDER=microsoft`, `elevenlabs` ou `microsoft,elevenlabs` e preencha as chaves correspondentes.
-
-## O Que Ainda Não Está Implementado
-
-A biblioteca cobre o núcleo de fallback em aplicação, mas ainda não implementa itens operacionais de produto completo:
-
-```text
-API HTTP/gateway para produção
-dashboards de SLA
-alertas automáticos
-health check sintético contínuo
-multi-região OCI
-política por tenant/cliente
-reserva de capacidade
-relatório mensal de disponibilidade
-integração direta com LiveKit
-```
-
-## Observações
-
-O caminho xAI OCI é streaming via WebSocket. Microsoft e ElevenLabs são consumidos por HTTP streaming nesta lib: a resposta é lida em chunks e cada chunk vira um evento `audio`. Isso melhora tempo até o primeiro áudio no fallback externo, mas ainda não preserva continuidade se o xAI OCI já tiver começado a falar.
+Configure `microsoft`, `elevenlabs` ou `microsoft,elevenlabs` e preencha as chaves correspondentes.
