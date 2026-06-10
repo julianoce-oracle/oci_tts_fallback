@@ -142,8 +142,6 @@ async for event in tts.stream(text, mode=FallbackMode.HEDGED, hedges=2):
 
 No hedged, a mesma frase vai para mais de um WebSocket. O primeiro que emitir áudio vence; os outros são cancelados ou ignorados.
 
-Isso é o que antes estava descrito como `winner-takes-stream`: não é uma feature separada para você configurar, é a regra de segurança que faz o hedged não duplicar áudio.
-
 Bom para:
 
 - reduzir cauda de latência;
