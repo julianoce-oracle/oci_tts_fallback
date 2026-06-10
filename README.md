@@ -11,7 +11,7 @@ A lib usa **xAI OCI via WebSocket** como provedor principal. Se o WebSocket falh
 
 A ideia não é trocar de voz no meio da fala. A ideia é evitar silêncio e recuperar com segurança.
 
-## Modelo Mental
+## Metodologia
 
 Pense no fluxo assim:
 
